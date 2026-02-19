@@ -180,8 +180,8 @@ library(tidyr)
 library(foreach)           
 library(doSNOW)            
 
-N_CORR_MATRICES <- 10      
-M_DATASETS      <- 10      
+N_CORR_MATRICES <- 30      
+M_DATASETS      <- 20      
 TOTAL_RUNS      <- N_CORR_MATRICES * M_DATASETS
 
 N_SAMPLES   <- 50
@@ -349,4 +349,5 @@ if(nrow(results_log) > 0) {
     scale_fill_manual(values = c("LinDA" = "#E69F00", "MicroBVS" = "#56B4E9"))
   
   print(p1)
+
 }
