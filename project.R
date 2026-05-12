@@ -1,140 +1,102 @@
-library(MASS)
-library(clusterGeneration)
+library(MASS)              
+library(clusterGeneration) 
 library(LinDA)
-library(MicroBVS)
 library(corrplot)
+library(MicroBVS)
 library(ggplot2)
-library(reshape2)
+library(tidyr)
+library(foreach)
+library(doSNOW)
 
-simulate_data_sequenced <- function(n_samples, n_taxa, rho, n_signif=2, effect_size=1.5, depth=5000) {
+#Correlation Plots
+
+qzip_matrix <- function(U, p, Lambda_mat) {
+  X <- matrix(0, nrow = nrow(U), ncol = ncol(U))
+  mask <- U > p
+  U_rescaled <- (U - p) / (1 - p)
+  if(any(mask)) {
+    X[mask] <- qpois(U_rescaled[mask], Lambda_mat[mask])
+  }
+  return(X)
+}
+
+simulate_with_covariates <- function(n_samples, n_taxa, rho, p_zero = 0.2, n_signif_taxa = 2, eff_list) {
   treatment <- rbinom(n_samples, 1, 0.5)
-  noise_var <- rnorm(n_samples)
-  meta_df <- data.frame(Treatment = factor(treatment), NoiseVar = noise_var)
+  age       <- rnorm(n_samples, 35, 10)
+  bmi       <- rnorm(n_samples, 24, 4)
+  plaque    <- runif(n_samples, 0, 3) 
   
-  beta_0 <- runif(n_taxa, 3, 5) 
-  beta_treatment <- rep(0, n_taxa)
+  meta_df <- data.frame(Treatment = factor(treatment), Age = age, BMI = bmi, Plaque = plaque)
   
-  true_taxa_indices <- seq_len(min(n_signif, n_taxa))
-  if(length(true_taxa_indices) > 0) beta_treatment[true_taxa_indices] <- effect_size 
+  beta_0 <- runif(n_taxa, 1, 3) 
+  B <- matrix(0, nrow = 4, ncol = n_taxa) 
   
-  Lambda_mat <- matrix(NA, nrow=n_samples, ncol=n_taxa)
-  for(j in 1:n_taxa) {
-    Lambda_mat[, j] <- exp(beta_0[j] + (beta_treatment[j] * treatment))
+  actual_signif <- min(n_signif_taxa, n_taxa)
+  true_idx <- seq_len(actual_signif)
+  
+  if(actual_signif > 0){
+    B[1, true_idx] <- eff_list$cat
+    B[2, true_idx] <- eff_list$age
+    B[3, true_idx] <- eff_list$bmi
+    B[4, true_idx] <- eff_list$plq
   }
   
-  Sigma <- rho
-  if (!isSymmetric(Sigma)) Sigma[lower.tri(Sigma)] <- t(Sigma)[lower.tri(Sigma)]
+  Lambda_mat <- matrix(NA, nrow = n_samples, ncol = n_taxa)
+  X_design   <- cbind(treatment, scale(age), scale(bmi), scale(plaque))
   
-  Z <- mvrnorm(n_samples, mu=rep(0, n_taxa), Sigma=Sigma)
+  for(j in 1:n_taxa) {
+    Lambda_mat[, j] <- exp(beta_0[j] + X_design %*% B[, j])
+  }
+  
+  if (!isSymmetric(rho)) {
+    rho[lower.tri(rho)] <- t(rho)[lower.tri(rho)]
+  }
+  
+  Z <- mvrnorm(n_samples, mu = rep(0, n_taxa), Sigma = rho)
   U <- pnorm(Z)
   
-  raw_counts <- matrix(0, nrow=n_samples, ncol=n_taxa)
-  for(j in 1:n_taxa) raw_counts[,j] <- qpois(U[,j], Lambda_mat[,j])
+  OTU_table <- qzip_matrix(U, p_zero, Lambda_mat) 
   
-  sequenced_counts <- matrix(0, nrow=n_samples, ncol=n_taxa)
-  for(i in 1:n_samples) {
-    total <- sum(raw_counts[i, ])
-    if(total > 0) probs <- raw_counts[i, ] / total else probs <- rep(1/n_taxa, n_taxa)
-    sequenced_counts[i, ] <- rmultinom(1, size=depth, prob=probs)
-  }
+  colnames(OTU_table) <- paste0("Taxon_", 1:n_taxa)
+  rownames(OTU_table) <- paste0("Sample_", 1:n_samples)
   
-  colnames(sequenced_counts) <- paste0("Taxon_", 1:n_taxa)
-  rownames(sequenced_counts) <- paste0("Sample_", 1:n_samples)
-  
-  return(list(otu = sequenced_counts, 
-              meta = meta_df, 
-              truth = true_taxa_indices))
+  return(list(otu = OTU_table, meta = meta_df, truth = true_idx))
 }
 
 set.seed(123)
 
-N <- 100
-D <- 5
-S <- 2
-EFF_SIZE <- 1.5
+N <- 100    
+D <- 5      
+S <- 2      
 
-my_rho_matrix <- matrix(c(
-  1.0,  -0.3,  -0.8,  0.0,  0.0,
-  -0.3,  1.0,  0.5,  0.0,  0.0,
-  -0.8,  0.5,  1.0, 0,  0,
-  0.0,  0.0, 0,  1.0,  0.0,
-  0.0,  0.0,  0,  0.0,  1.0
+eff_list <- list(cat = 1.5, age = 0, bmi = 0.7, plq = 0.9)
+
+rho_matrix <- matrix(c(
+  1.0,  0.8,  0.0,  0.0,  0.0,  
+  0.8,  1.0,  0.0,  0.0,  0.0,  
+  0.0,  0.0,  1.0, -0.6,  0.2,  
+  0.0,  0.0, -0.6,  1.0,  0.0,  
+  0.0,  0.0,  0.2,  0.0,  1.0   
 ), nrow = 5, ncol = 5, byrow = TRUE)
 
-colnames(my_rho_matrix) <- rownames(my_rho_matrix) <- paste0("Taxon_", 1:D)
-
-eigen_vals <- eigen(my_rho_matrix)$values
-if(any(eigen_vals <= 0)) {
-  stop("Error: The matrix is not Positive Definite. Adjust your values.")
-} else {
-  print("Matrix is valid! Proceeding to simulation...")
-}
-
-sim <- simulate_data_sequenced(
+sim_data <- simulate_with_covariates(
   n_samples = N, 
   n_taxa = D, 
-  rho = my_rho_matrix, 
-  n_signif = S, 
-  effect_size = EFF_SIZE
+  rho = rho_matrix, 
+  n_signif_taxa = S, 
+  eff_list = eff_list
 )
 
-otu_tab <- sim$otu
-meta_dat <- sim$meta
-true_positives <- sim$truth
-
-par(mfrow=c(1,2))
-corrplot(my_rho_matrix, method = "color", title = "Input Correlation (Truth)", 
-         mar = c(0,0,2,0), addCoef.col = "black", tl.col = "black")
-
-boxplot(otu_tab[, 1] ~ meta_dat$Treatment, 
-        main="Taxon 1 (Signal)", col=c("pink", "lightblue"), ylab="Reads")
-par(mfrow=c(1,1))
+colnames(rho_matrix) <- rownames(rho_matrix) <- paste0("Taxon_", 1:D)
+otu_tab <- as.data.frame(sim_data$otu)
+meta_dat <- sim_data$meta
 
 res_linda <- linda(
-  otu.tab = t(otu_tab), 
+  otu.tab = t(otu_tab),      
   meta = meta_dat, 
-  formula = '~Treatment + NoiseVar', 
+  formula = '~Treatment + Age + BMI + Plaque', 
   alpha = 0.05
 )
-
-target <- grep("Treatment", names(res_linda$output), value=TRUE)[1]
-linda_res <- res_linda$output[[target]]
-linda_detected <- rownames(linda_res)[linda_res$reject]
-
-z_mat <- as.matrix(otu_tab)
-x_mat <- model.matrix(~ Treatment + NoiseVar, data = meta_dat)[, -1, drop=FALSE]
-
-fit <- DMbvs_R(
-  z = z_mat, 
-  x = x_mat, 
-  prior = "BB", 
-  iterations = 5000,
-  thin = 5,
-  seed = 123
-)
-
-n_saved <- dim(fit$zeta)[3]
-res_mbvs <- selected_DM(dm_obj = fit, burnin = floor(n_saved/2), plotting = FALSE)
-
-pips <- res_mbvs$mppi
-if(ncol(pips) != ncol(z_mat)) pips <- t(pips)
-rn <- if(nrow(pips) == ncol(x_mat)+1) c("Intercept", colnames(x_mat)) else colnames(x_mat)
-rownames(pips) <- rn
-colnames(pips) <- colnames(z_mat)
-
-target_row <- grep("Treatment", rownames(pips), value=TRUE)[1]
-pip_data <- data.frame(
-  Taxon = colnames(pips),
-  PIP = pips[target_row, ]
-)
-
-ggplot(pip_data, aes(x = Taxon, y = PIP, fill = PIP)) +
-  geom_bar(stat = "identity") +
-  geom_hline(yintercept = 0.5, linetype="dashed", color="red") +
-  scale_fill_gradient(low = "grey", high = "blue") +
-  labs(title = "MicroBVS Detection Probabilities",
-       y = "Posterior Inclusion Probability (PIP)") +
-  theme_minimal()
 
 clr <- function(x) {
   log_x <- log(x + 0.5) 
@@ -142,60 +104,48 @@ clr <- function(x) {
 }
 
 otu_clr <- t(apply(otu_tab, 1, clr))
+fit_multi <- lm(otu_clr ~ Treatment + Age + BMI + Plaque, data = meta_dat)
+residuals_multi <- residuals(fit_multi)
+residual_correlation_multi <- cor(residuals_multi)
 
-n_taxa <- ncol(otu_clr)
-residuals_mat <- matrix(NA, nrow=nrow(otu_clr), ncol=n_taxa)
-colnames(residuals_mat) <- colnames(otu_tab)
+par(mfrow = c(1, 2)) 
 
-for(j in 1:n_taxa) {
-  fit <- lm(otu_clr[, j] ~ Treatment + NoiseVar, data = meta_dat)
-  residuals_mat[, j] <- residuals(fit)
-}
-
-recovered_rho <- cor(residuals_mat)
-
-par(mfrow=c(1,2))
-corrplot(my_rho_matrix, 
+corrplot(rho_matrix, 
          method = "color", 
-         title = "Input Correlation (Truth)", 
-         mar = c(0,0,2,0), 
+         title = "True Sigma Matrix", 
+         mar = c(0, 0, 2, 0),
          addCoef.col = "black", 
-         tl.col = "black",
-         cl.lim = c(-1, 1))
+         tl.col = "black")
 
-corrplot(recovered_rho, 
+corrplot(residual_correlation_multi, 
          method = "color", 
-         title = "Recovered Correlation (Residuals)", 
-         mar = c(0,0,2,0), 
-         addCoef.col = "black", 
-         tl.col = "black",
-         cl.lim = c(-1, 1))
+         title = "Multivariate Residual Correlation", 
+         mar = c(0, 0, 2, 0),
+         addCoef.col = "black")
 
-library(MASS)              
-library(LinDA)             
-library(MicroBVS)          
-library(clusterGeneration) 
-library(ggplot2)           
-library(tidyr)
-library(foreach)           
-library(doSNOW)            
 
-N_CORR_MATRICES <- 30      
-M_DATASETS      <- 20      
+
+
+
+#LINDA VS MicroBVS
+
+N_CORR_MATRICES <- 10
+M_DATASETS      <- 10
 TOTAL_RUNS      <- N_CORR_MATRICES * M_DATASETS
 
 N_SAMPLES   <- 50
-N_TAXA      <- 50            
-N_SIGNIF    <- 5             
+N_TAXA      <- 50
+N_SIGNIF    <- 5
+EFFECT_SIZE <- 0.5
 
-EFFECT_SIZE <- 0.5     
-
-MCMC_ITERATIONS <- 10000   
-MCMC_THIN       <- 10      
-Bn              <- 0.5     
+MCMC_ITERATIONS <- 10000
+MCMC_THIN       <- 10
+Bn              <- 0.5
 
 EXPECTED_SAVED  <- MCMC_ITERATIONS / MCMC_THIN
 BURNIN_COUNT    <- floor(EXPECTED_SAVED * Bn)
+
+print(paste("Settings: Total Iterations =", MCMC_ITERATIONS, "| Saved =", EXPECTED_SAVED, "| Burn-in =", BURNIN_COUNT))
 
 calc_perf <- function(detected_names, true_names, total_possible) {
   TP <- length(intersect(detected_names, true_names))
@@ -204,8 +154,8 @@ calc_perf <- function(detected_names, true_names, total_possible) {
   
   sens <- ifelse(length(true_names) > 0, TP / length(true_names), 0)
   prec <- ifelse(length(detected_names) > 0, TP / length(detected_names), 0)
-  fdr <- 1 - prec
-  f1 <- ifelse((prec + sens) > 0, 2 * (prec * sens) / (prec + sens), 0)
+  fdr  <- 1 - prec
+  f1   <- ifelse((prec + sens) > 0, 2 * (prec * sens) / (prec + sens), 0)
   
   return(c(Sensitivity = sens, FDR = fdr, F1_Score = f1))
 }
@@ -213,7 +163,7 @@ calc_perf <- function(detected_names, true_names, total_possible) {
 simulate_data_sequenced <- function(n_samples, n_taxa, rho, n_signif=2, effect_size=1.5, depth=5000) {
   treatment <- rbinom(n_samples, 1, 0.5)
   noise_var <- rnorm(n_samples)
-  meta_df <- data.frame(Treatment = factor(treatment), NoiseVar = noise_var)
+  meta_df   <- data.frame(Treatment = factor(treatment), NoiseVar = noise_var)
   
   beta_0 <- runif(n_taxa, 3, 5) 
   beta_treatment <- rep(0, n_taxa)
@@ -249,6 +199,7 @@ num_cores <- parallel::detectCores() - 1
 cl <- makeCluster(num_cores)
 registerDoSNOW(cl)
 
+print(paste("Parallel Cluster initiated with", num_cores, "cores."))
 pb <- txtProgressBar(max = TOTAL_RUNS, style = 3)
 progress <- function(n) setTxtProgressBar(pb, n)
 opts <- list(progress = progress)
@@ -270,20 +221,20 @@ results_log <- foreach(mat_id = 1:N_CORR_MATRICES, .combine = rbind,
     sim <- simulate_data_sequenced(N_SAMPLES, N_TAXA, rho, n_signif = N_SIGNIF, 
                                    effect_size = EFFECT_SIZE) 
     
-    otu_tab <- sim$otu
-    meta_dat <- sim$meta
+    otu_tab    <- sim$otu
+    meta_dat   <- sim$meta
     true_names <- sim$truth
     
     iter_res <- data.frame()
     
     try({
       t0 <- Sys.time()
-      res_linda <- linda(t(otu_tab), meta_dat, formula = '~Treatment+NoiseVar', alpha = 0.05)
+      res_linda  <- linda(t(otu_tab), meta_dat, formula = '~Treatment+NoiseVar', alpha = 0.05)
       time_linda <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
-      target <- grep("Treatment", names(res_linda$output), value=TRUE)[1]
+      target     <- grep("Treatment", names(res_linda$output), value=TRUE)[1]
       linda_detected <- rownames(res_linda$output[[target]])[res_linda$output[[target]]$reject]
-      perf <- calc_perf(linda_detected, true_names, N_TAXA)
-      iter_res <- rbind(iter_res, data.frame(MatrixID=mat_id, DatasetID=data_id, Method="LinDA", Sensitivity=perf["Sensitivity"], FDR=perf["FDR"], F1=perf["F1_Score"], Time=time_linda))
+      perf       <- calc_perf(linda_detected, true_names, N_TAXA)
+      iter_res   <- rbind(iter_res, data.frame(MatrixID=mat_id, DatasetID=data_id, Method="LinDA", Sensitivity=perf["Sensitivity"], FDR=perf["FDR"], F1=perf["F1_Score"], Time=time_linda))
     }, silent=TRUE)
     
     try({
@@ -293,7 +244,7 @@ results_log <- foreach(mat_id = 1:N_CORR_MATRICES, .combine = rbind,
       
       if(sum(keep_cols) >= 2) {
         z_filt <- z_mat[, keep_cols, drop=FALSE]
-        x_mat <- model.matrix(~ Treatment + NoiseVar, data = meta_dat)[, -1, drop = FALSE]
+        x_mat  <- model.matrix(~ Treatment + NoiseVar, data = meta_dat)[, -1, drop = FALSE]
         
         fit <- DMbvs_R(
           z = z_filt, 
@@ -316,7 +267,7 @@ results_log <- foreach(mat_id = 1:N_CORR_MATRICES, .combine = rbind,
         rownames(pips) <- rn
         colnames(pips) <- colnames(z_filt)
         
-        target_row <- grep("Treatment", rownames(pips), value=TRUE)[1]
+        target_row    <- grep("Treatment", rownames(pips), value=TRUE)[1]
         mbvs_detected <- names(which(pips[target_row, ] > 0.5))
         
         perf <- calc_perf(mbvs_detected, true_names, N_TAXA)
@@ -333,9 +284,11 @@ results_log <- foreach(mat_id = 1:N_CORR_MATRICES, .combine = rbind,
 
 close(pb)
 stopCluster(cl)
+print(paste("Total Simulation Time:", round(difftime(Sys.time(), start_time, units="mins"), 2), "minutes"))
 
 if(nrow(results_log) > 0) {
-  aggregate(cbind(Sensitivity, FDR, F1, Time) ~ Method, data = results_log, mean)
+  print("--- Final Performance Summary ---")
+  print(aggregate(cbind(Sensitivity, FDR, F1, Time) ~ Method, data = results_log, mean))
   
   results_long <- pivot_longer(results_log, cols = c("Sensitivity", "FDR", "F1"), 
                                names_to = "Metric", values_to = "Score")
@@ -344,10 +297,12 @@ if(nrow(results_log) > 0) {
     geom_boxplot(alpha=0.7, outlier.shape = 1) +
     facet_wrap(~Metric, scales = "free_y") +
     labs(title="LinDA vs MicroBVS", 
+         subtitle = paste0("N=", N_SAMPLES, ", Taxa=", N_TAXA, ", Effect=", EFFECT_SIZE),
          y="Score (0 to 1)") +
     theme_minimal() +
     scale_fill_manual(values = c("LinDA" = "#E69F00", "MicroBVS" = "#56B4E9"))
   
   print(p1)
-
+} else {
+  print("Simulation produced no results.")
 }
