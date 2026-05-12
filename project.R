@@ -306,3 +306,141 @@ if(nrow(results_log) > 0) {
 } else {
   print("Simulation produced no results.")
 }
+
+
+
+#Data Analysis
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+data <- read.csv("C:/Users/TANMOY/Downloads/PLQDat(1).csv")
+
+otu_tab <- data[, 1:339]
+meta_dat <- data[, 340:ncol(data)]
+
+cols_to_drop <- c("patid", "sampleid", "total")
+meta_dat <- meta_dat[, !(names(meta_dat) %in% cols_to_drop)]
+
+meta_dat$hiv <- as.factor(meta_dat$hiv)
+meta_dat$sex_female <- as.factor(meta_dat$sex_female)
+meta_dat$hiv <- relevel(meta_dat$hiv, ref = "PHEU") 
+
+otu_linda <- t(otu_tab)
+res_linda <- linda(
+  otu.tab = otu_linda, 
+  meta = meta_dat, 
+  formula = '~ hiv + age_yrs + sex_female + race_black + ethn_hispanic + periodontitis + dmfst_dmfst + dmfst_cariest + ohq_clean_12mo', 
+  alpha = 0.05
+)
+
+target_linda <- grep("hivPHIV", names(res_linda$output), value = TRUE)[1]
+linda_out <- res_linda$output[[target_linda]]
+
+keep_taxa <- colMeans(otu_tab > 0) > 0.05
+otu_mbvs <- as.matrix(otu_tab[, keep_taxa])
+
+x_mat <- model.matrix(~ hiv + age_yrs + sex_female + race_black + ethn_hispanic + periodontitis + dmfst_dmfst + dmfst_cariest + ohq_clean_12mo, data = meta_dat)[, -1]
+
+set.seed(42)
+fit_mbvs <- DMbvs_R(
+  z = otu_mbvs, 
+  x = x_mat, 
+  prior = "BB", 
+  iterations = 20000, 
+  thin = 10, 
+  seed = 42
+)
+
+bn <- floor(dim(fit_mbvs$zeta)[3] * 0.5) 
+res_mbvs <- selected_DM(fit_mbvs, burnin = bn, plotting = FALSE)
+pips <- res_mbvs$mppi
+
+if(is.null(dim(pips))) {
+  pips <- matrix(pips, nrow = ncol(x_mat), byrow = FALSE)
+}
+rownames(pips) <- colnames(x_mat)
+colnames(pips) <- colnames(otu_mbvs)
+
+hiv_pips <- pips[grep("hivPHIV", rownames(pips)), ]
+
+common_taxa <- colnames(otu_mbvs)
+linda_subset <- linda_out[common_taxa, c("log2FoldChange", "pvalue", "padj")]
+
+consensus_df <- data.frame(
+  Taxon = common_taxa,
+  LinDA_LFC = round(linda_subset$log2FoldChange, 4),
+  LinDA_pval = round(linda_subset$pvalue, 4),
+  LinDA_padj = round(linda_subset$padj, 4),
+  MicroBVS_PIP = round(hiv_pips, 4)
+)
+
+consensus_df <- consensus_df[order(-consensus_df$MicroBVS_PIP, consensus_df$LinDA_pval), ]
+
+write.csv(consensus_df, "Real_Data_Consensus_Results.csv", row.names = FALSE)
+
+
+
+#EDA
+
+data <- read.csv("C:/Users/TANMOY/Downloads/PLQDat(1).csv")
+otu_tab <- data[, 1:339]
+meta_dat <- data[, 340:ncol(data)]
+
+meta_dat$hiv <- factor(meta_dat$hiv, levels = c("PHEU", "PHIV"))
+
+seq_depth <- rowSums(otu_tab)
+print("Summary Statistics for Sequencing Depth:")
+print(summary(seq_depth))
+print(paste("Standard Deviation:", sd(seq_depth)))
+
+p_depth <- ggplot(data.frame(Depth = seq_depth), aes(x = Depth)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black", alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "Distribution of Sequencing Depth",
+       x = "Total Reads per Sample",
+       y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("EDA_SeqDepth.png", p_depth, width = 6, height = 4, dpi = 300)
+
+total_elements <- nrow(otu_tab) * ncol(otu_tab)
+total_zeros <- sum(otu_tab == 0)
+sparsity_pct <- (total_zeros / total_elements) * 100
+
+print(paste("Overall Matrix Sparsity: ", round(sparsity_pct, 2), "%"))
+
+prevalence <- colMeans(otu_tab > 0)
+print(paste("> 5% of samples:", sum(prevalence > 0.05)))
+print(paste("> 10% of samples:", sum(prevalence > 0.10)))
+print(paste("> 25% of samples:", sum(prevalence > 0.25)))
+
+binary_vars <- c("sex_female", "race_black", "ethn_hispanic", "periodontitis", "ohq_clean_12mo")
+
+for(var in binary_vars) {
+  if(var %in% colnames(meta_dat)) {
+    print(paste("--- Variable:", var, "---"))
+    tbl <- table(meta_dat[[var]], meta_dat$hiv, useNA = "ifany")
+    print(tbl)
+    print(round(prop.table(tbl, margin = 2) * 100, 1)) 
+  }
+}
+
+p_age <- ggplot(meta_dat, aes(x = age_yrs, fill = hiv)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("PHEU" = "#2ca02c", "PHIV" = "#d62728")) +
+  theme_minimal() +
+  labs(title = "Age Distribution by HIV Status", x = "Age (Years)", y = "Density", fill = "HIV Status") +
+  theme(legend.position = "bottom")
+
+p_caries <- ggplot(meta_dat, aes(x = dmfst_cariest, fill = hiv)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("PHEU" = "#2ca02c", "PHIV" = "#d62728")) +
+  theme_minimal() +
+  labs(title = "Untreated Caries by HIV Status", x = "DMFS (Caries)", y = "Density", fill = "HIV Status") +
+  theme(legend.position = "bottom")
+
+p_combined <- p_age + p_caries
+ggsave("EDA_Covariate_Balance.png", p_combined, width = 10, height = 4, dpi = 300)
